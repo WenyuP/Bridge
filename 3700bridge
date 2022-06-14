@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+
+import sys
+import socket
+import select
+import json
+import argparse
+
+# First, grab our arguments from the command line
+#  bridge_id is our bridge ID ("1234" or whatever)
+#  lan_ports are the local UDP ports that we use to send/receive packets on our LAN(s)
+import time
+from threading import Lock
+
+parser = argparse.ArgumentParser(description='CS 3700 bridge')
+parser.add_argument('bridge_id', type=str, help="Bridge ID (e.g., 02ab)")
+parser.add_argument('lan_ports', metavar='lan_port', type=int, nargs='+', help="UDP ports to connect to LANs")
+args = parser.parse_args()
+
+class BPDU:
+    def __init__(self, id, root, cost, port):
+        self.id = id
+        self.root = root
+        self.cost = cost
+        self.port = port
+
+    def __lt__(self, other):
+        if self.root < other.root:
+            return -1
+        elif self.cost < other.cost:
+            return -1
+        elif self.id < other.id:
+            return -1
+        elif self.port < other.port:
+            return -1
+        else:
+            return 0
+
+    def __eq__(self, other):
+        return self.root == other.root and self.cost == other.cost and self.id == other.id and self.port == other.port
+
+    def __str__(self):
+        return "[root: " + str(self.root) + ", cost: " + str(self.cost) + ", id: " + str(self.id) + ", port: " + \
+               str(self.port) + "]"
+
+# This variable represents our bridge's ports.  It is a 0-indexed array, as per the project spec
+PORTS = []
+CLOSED = []
+closed_port = []
+bridge_id = args.bridge_id
+ftable = {}
+root_bridge = args.bridge_id
+root_port = 0
+data_sent = []
+cost = 0
+best_bpdu = BPDU(bridge_id, bridge_id, 0, 0)
+bpdu_list = [best_bpdu]
+
+
+# Definition of a port
+class Port:
+    def __init__(self, id, lan_port):
+        self.bridge_id = args.bridge_id
+        self.id = id
+        self.lan_port = lan_port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+        self.lock = Lock()
+        self.root_bridge = args.bridge_id
+        self.cost = 0
+        self.designated = True
+        self.enabled = True
+        self.data_table = set()
+        self.bpdu = BPDU(bridge_id, root_bridge, 0, self.lan_port)
+        self.bpdu_table = [self.bpdu]
+
+    # This method sends a BPDU on this port.
+    def send_bpdu(self):
+        print("Send bpdu from port", self.id)
+        self.send(json.dumps({"source": bridge_id,
+                              "dest": "ffff",
+                              "msg_id": 0,
+                              "type": "bpdu",
+                              "message": {"id": bridge_id,
+                                          "root": best_bpdu.root,
+                                          "cost": best_bpdu.cost,
+                                          "port": self.lan_port}
+                              }).encode('utf-8'))
+
+    # Process packet by examine its type.
+    def process_packet(self, packet, addr):
+        if packet['type'] == 'bpdu':
+            self.process_bpdu(packet)
+        if packet['type'] == 'data':
+            self.process_data(packet, addr)
+
+    # Process bpdu message received to see if our port should be disabled.
+    def process_bpdu(self, packet):
+        global root_bridge
+        global root_port
+        global closed_port
+        message = packet['message']
+        new_cost = message['cost']
+        new_root = message['root']
+        bid = message['id']
+        port = message['port']
+        source = packet['source']
+        bpdu = BPDU(bid, new_root, new_cost + 1, port)
+        if port != self.lan_port or self.id == root_port:
+            return
+        self.bpdu_table.append(bpdu)
+        self.bpdu_table.sort()
+        # If our bpdu is the best, then do nothing.
+        if self.bpdu == self.bpdu_table[0]:
+            return
+        # Otherwise, we are no longer the best port, then disable ourselves.
+        else:
+            print("Disabled port:", self.id)
+            self.designated = False
+            self.bpdu = self.bpdu_table[0]
+            if self.id not in closed_port:
+                closed_port.append(self.id)
+            self.send_bpdu()
+        print(closed_port)
+
+    # Update bpdu according to the packet received. This method updates only information inside the port.
+    def update_bpdu(self, packet):
+        global root_bridge
+        global root_port
+        global closed_port
+        global cost
+        message = packet['message']
+        new_cost = message['cost']
+        new_root = message['root']
+        bid = message['id']
+        port = message['port']
+        source = packet['source']
+        # If we have never heard this bpdu before.
+        if source not in self.bpdu_table and port == self.lan_port:
+            self.bpdu_table.append(source)
+        # If the new root is better than our root
+        if new_root < root_bridge:
+            root_bridge = new_root
+            cost = new_cost + 1
+            # root_port = self.id
+            self.enabled = True
+            print("New root:", root_bridge)
+            print("Root port:", root_port)
+            if self.id in closed_port:
+                closed_port.remove(self.id)
+            return True
+        # If the root are the same but the new bpdu has better cost or bridge id.
+        elif (new_root == root_bridge and new_cost + 1 < cost) or (
+                new_root == root_bridge and new_cost + 1 == cost and bid < bridge_id):
+            cost = new_cost + 1
+            return True
+        return False
+
+    # When the type of packet is data, use this method.
+    def process_data(self, packet, addr):
+        global data_sent
+        # If this port is closed, return.
+        if self.id in closed_port:
+            return
+
+        # if (packet['source'], packet['dest'], packet['msg_id']) in self.data_table:
+        #     return
+        # self.data_table.add((packet['source'], packet['dest'], packet['msg_id']))
+        src = packet['source']
+        dest = packet['dest']
+
+        # Add record to the forward table.
+        ftable[src] = (self, self.lan_port, time.time())
+
+        # Avoid sending message to the same port and trivial problem state.
+        if src == dest or len(PORTS) < 2:
+            print("For general reason not to forward message on port", self.id)
+            return
+
+        # If the data is sent, then don't send it again.
+        if (packet['source'], packet['dest'], packet['msg_id']) in data_sent:
+            print("Data already sent, not forwarding on port", self.id)
+            return
+
+        # Check if the destination is in forwarding table, forget this id if it is more than 1 second.
+        # Also, if the port is the same port stored in the forwarding table, then don't forward it.
+        # Otherwise, forward the message to that port.
+        if dest in ftable:
+            dest_port, port, prev_time = ftable[dest]
+            if port != self.lan_port:
+                if dest_port.id in closed_port or time.time() - prev_time > 1:
+                    print("Port", dest_port.lan_port, "forgotten")
+                else:
+                    print("Forwarding", packet['source'], packet['msg_id'], "by forwarding table")
+                    if port != addr:
+                        dest_port.send(json.dumps(packet).encode('utf-8'))
+                        # data_sent.append((packet['source'], packet['dest'], packet['msg_id']))
+                    return
+
+        # If not in forwarding table, then broadcast message.
+        print("Broadcasting message", packet['source'], packet['msg_id'], "to all active ports")
+        for s in sockets:
+            p = PORTS[sockets.index(s)]
+            if (p.id == root_port or p.designated) and p.lan_port != addr:
+                p.send(json.dumps(packet).encode('utf-8'))
+        data_sent.append((packet['source'], packet['dest'], packet['msg_id']))
+
+    # This method sends the provided byte array "data" to the LAN, using the
+    # UDP connection.
+    def send(self, data):
+        print("Sending message on port %d" % self.id)
+        self.socket.sendto(data, ('localhost', self.lan_port))
+
+
+# Set up our ports
+print("Bridge starting up")
+for i, lan_port in enumerate(args.lan_ports):
+    PORTS.append(Port(i, lan_port))
+
+
+# This method sends a BPDU on all ports.  You might want to call this regularly...
+def send_bpdus():
+    for port in PORTS:
+        port.send_bpdu()
+
+# Update the root bridge by examine it globally
+def update_bpdu(packet):
+    global root_bridge
+    global root_port
+    global bpdu_list
+    global best_bpdu
+    global ftable
+    message = packet['message']
+    cur = BPDU(message['id'], message['root'], message['cost'] + 1, message['port'])
+    bpdu_list.append(cur)
+    bpdu_list.sort()
+    # Check the best bpdu
+    best_bpdu = bpdu_list[0]
+    # If we are the root, do nothing.
+    if best_bpdu.root == bridge_id:
+        return
+    # Then we are not the new root.
+    print("New root:", best_bpdu.root, "cost", best_bpdu.cost)
+    # Check to see which port is the new root port.
+    for port in PORTS:
+        if port.lan_port == best_bpdu.port:
+            root_port = port.id
+            print("Root port:", port.id)
+            ftable = {}
+
+# Now we send a "hello" BPDU to all LANs to announce that we're here
+send_bpdus()
+
+
+def getTime():
+    return int(time.time() * 1000)
+
+
+boardcast = getTime()
+# Main loop
+while True:
+    sockets = list(map(lambda p: p.socket, PORTS))
+    readable, _, execeptable = select.select(sockets, [], sockets)
+
+    # if boardcast + 500 < getTime():
+    #     send_bpdus()
+    #     boardcast = getTime()
+
+    for s in readable:
+        data, addr = s.recvfrom(1500)
+        message = data.decode('utf-8')
+        message = json.loads(message)
+        if message['type'] == 'bpdu':
+            update_bpdu(message)
+        port = PORTS[sockets.index(s)]
+        port.process_packet(message, addr)
+
+        print("Received message: '%s'" % message, "on port", port.id)
